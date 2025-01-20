@@ -30,6 +30,7 @@ namespace FORWARD
 		const float* opacities,
 		const float* dc,
 		const float* shs,
+		const float* dc_objs,
 		bool* clamped,
 		const float* cov3D_precomp,
 		const float* colors_precomp,
@@ -56,10 +57,11 @@ namespace FORWARD
 		const uint2* ranges,
 		const uint32_t* point_list,
 		const uint32_t* per_tile_bucket_offset, uint32_t* bucket_to_tile,
-		float* sampled_T, float* sampled_ar, float* sampled_ard,
+		float* sampled_T, float* sampled_ar, float* sampled_ard, float* sampled_ar_objs,
 		int W, int H,
 		const float2* points_xy_image,
 		const float* features,
+		const float* obj_features,
 		const float4* conic_opacity,
 		float* final_T,
 		uint32_t* n_contrib,
@@ -67,7 +69,8 @@ namespace FORWARD
 		const float* bg_color,
 		float* out_color,
 		float* depths,
-		float* depth);
+		float* out_invdepth,
+		float* out_objects);
 }
 
 

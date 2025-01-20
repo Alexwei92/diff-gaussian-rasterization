@@ -171,10 +171,10 @@ __global__ void duplicateWithKeys(
 				key <<= 32;
 				key |= *((uint32_t*)&depths[idx]);
 				if (max_opac_factor <= opacity_factor_threshold) {
-				gaussian_keys_unsorted[off] = key;
-				gaussian_values_unsorted[off] = idx;
-				off++;
-			}
+					gaussian_keys_unsorted[off] = key;
+					gaussian_values_unsorted[off] = idx;
+					off++;
+				}
 		}
 	}
 
@@ -277,6 +277,7 @@ CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, s
 	obtain(chunk, img.max_contrib, N, 128);
 	obtain(chunk, img.pixel_colors, N * NUM_CHANNELS_3DGS, 128);
 	obtain(chunk, img.pixel_invDepths, N, 128);
+	obtain(chunk, img.pixel_objects, N * OBJECTS_SIZE, 128);
 	obtain(chunk, img.bucket_count, N, 128);
 	obtain(chunk, img.bucket_offsets, N, 128);
 	cub::DeviceScan::InclusiveSum(nullptr, img.bucket_count_scan_size, img.bucket_count, img.bucket_count, N);
@@ -291,6 +292,7 @@ CudaRasterizer::SampleState CudaRasterizer::SampleState::fromChunk(char *& chunk
 	obtain(chunk, sample.T, C * BLOCK_SIZE, 128);
 	obtain(chunk, sample.ar, NUM_CHANNELS_3DGS * C * BLOCK_SIZE, 128);
 	obtain(chunk, sample.ard, C * BLOCK_SIZE, 128);
+	obtain(chunk, sample.ar_objs, OBJECTS_SIZE * C * BLOCK_SIZE, 128);
 	return sample;
 }
 
@@ -342,6 +344,7 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 	const float* means3D,
 	const float* dc,
 	const float* shs,
+	const float* dc_objs,
 	const float* colors_precomp,
 	const float* opacities,
 	const float* scales,
@@ -354,7 +357,8 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,
 	float* out_color,
-	float* invdepth,
+	float* out_invdepth,
+	float* out_objects,
 	bool antialiasing,
 	int* radii,
 	bool debug)
@@ -394,6 +398,7 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 		opacities,
 		dc,
 		shs,
+		dc_objs,
 		geomState.clamped,
 		cov3D_precomp,
 		colors_precomp,
@@ -474,15 +479,17 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+	const float* obj_feature_ptr = dc_objs;
 	CHECK_CUDA(FORWARD::render(
 		tile_grid, block,
 		imgState.ranges,
 		binningState.point_list,
 		imgState.bucket_offsets, sampleState.bucket_to_tile,
-		sampleState.T, sampleState.ar, sampleState.ard,
+		sampleState.T, sampleState.ar, sampleState.ard, sampleState.ar_objs,
 		width, height,
 		geomState.means2D,
 		feature_ptr,
+		obj_feature_ptr,
 		geomState.conic_opacity,
 		imgState.accum_alpha,
 		imgState.n_contrib,
@@ -490,10 +497,12 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 		background,
 		out_color,
 		geomState.depths,
-		invdepth), debug)
+		out_invdepth,
+		out_objects), debug)
 
 	CHECK_CUDA(cudaMemcpy(imgState.pixel_colors, out_color, sizeof(float) * width * height * NUM_CHANNELS_3DGS, cudaMemcpyDeviceToDevice), debug);
-	CHECK_CUDA(cudaMemcpy(imgState.pixel_invDepths, invdepth, sizeof(float) * width * height, cudaMemcpyDeviceToDevice), debug);
+	CHECK_CUDA(cudaMemcpy(imgState.pixel_invDepths, out_invdepth, sizeof(float) * width * height, cudaMemcpyDeviceToDevice), debug);
+	CHECK_CUDA(cudaMemcpy(imgState.pixel_objects, out_objects, sizeof(float) * width * height * OBJECTS_SIZE, cudaMemcpyDeviceToDevice), debug);
 	return std::make_tuple(num_rendered, bucket_sum);
 }
 
@@ -506,6 +515,7 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* means3D,
 	const float* dc,
 	const float* shs,
+	const float* dc_objs,
 	const float* colors_precomp,
 	const float* opacities,
 	const float* scales,
@@ -523,15 +533,18 @@ void CudaRasterizer::Rasterizer::backward(
 	char* sample_buffer,
 	const float* dL_dpix,
 	const float* dL_invdepths,
+	const float* dL_dpix_objs,
 	float* dL_dmean2D,
 	float* dL_dconic,
 	float* dL_dopacity,
 	float* dL_dcolor,
 	float* dL_dinvdepth,
+	float* dL_dobjects,
 	float* dL_dmean3D,
 	float* dL_dcov3D,
 	float* dL_ddc,
 	float* dL_dsh,
+	// float* dL_ddc_objs,
 	float* dL_dscale,
 	float* dL_drot,
 	bool antialiasing,
@@ -557,6 +570,7 @@ void CudaRasterizer::Rasterizer::backward(
 	// opacity and RGB of Gaussians from per-pixel loss gradients.
 	// If we were given precomputed colors and not SHs, use them.
 	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
+	const float* obj_ptr = dc_objs;
 	CHECK_CUDA(BACKWARD::render(
 		tile_grid,
 		block,
@@ -565,26 +579,28 @@ void CudaRasterizer::Rasterizer::backward(
 		width, height, R, B,
 		imgState.bucket_offsets,
 		sampleState.bucket_to_tile,
-		sampleState.T,
-		sampleState.ar,
-		sampleState.ard,
+		sampleState.T, sampleState.ar, sampleState.ard, sampleState.ar_objs,
 		background,
 		geomState.means2D,
 		geomState.conic_opacity,
 		color_ptr,
 		geomState.depths,
+		obj_ptr,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		imgState.max_contrib,
 		imgState.pixel_colors,
 		imgState.pixel_invDepths,
+		imgState.pixel_objects,
 		dL_dpix,
 		dL_invdepths,
+		dL_dpix_objs,
 		(float3*)dL_dmean2D,
 		(float4*)dL_dconic,
 		dL_dopacity,
 		dL_dcolor,
-		dL_dinvdepth), debug)
+		dL_dinvdepth,
+		dL_dobjects), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
@@ -612,9 +628,11 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dopacity,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,
+		dL_dobjects,
 		dL_dcov3D,
 		dL_ddc,
 		dL_dsh,
+		// dL_ddc_objs,
 		(glm::vec3*)dL_dscale,
 		(glm::vec4*)dL_drot,
 		antialiasing), debug)

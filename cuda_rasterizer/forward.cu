@@ -153,7 +153,7 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 }
 
 // Perform initial steps for each Gaussian prior to rasterization.
-template<int C>
+template<int C, int O>
 __global__ void preprocessCUDA(int P, int D, int M,
 	const float* orig_points,
 	const glm::vec3* scales,
@@ -162,6 +162,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const float* opacities,
 	const float* dc,
 	const float* shs,
+	const float* dc_objs,
 	bool* clamped,
 	const float* cov3D_precomp,
 	const float* colors_precomp,
@@ -278,16 +279,17 @@ __global__ void preprocessCUDA(int P, int D, int M,
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
-template <uint32_t CHANNELS>
+template <uint32_t CHANNELS, uint32_t OBJECTS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	const uint32_t* __restrict__ per_tile_bucket_offset, uint32_t* __restrict__ bucket_to_tile,
-	float* __restrict__ sampled_T, float* __restrict__ sampled_ar, float* __restrict__ sampled_ard,
+	float* __restrict__ sampled_T, float* __restrict__ sampled_ar, float* __restrict__ sampled_ard, float* __restrict__ sampled_ar_objs,
 	int W, int H,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
+	const float* __restrict__ obj_features,
 	const float4* __restrict__ conic_opacity,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
@@ -295,7 +297,8 @@ renderCUDA(
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
 	const float* __restrict__ depths,
-	float* __restrict__ invdepth)
+	float* __restrict__ out_invdepth,
+	float* __restrict__ out_objects)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -339,6 +342,7 @@ renderCUDA(
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
 	float expected_invdepth = 0.0f;
+	float O[OBJECTS] = { 0 };
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -369,6 +373,9 @@ renderCUDA(
 					sampled_ar[(bbm * BLOCK_SIZE * CHANNELS) + ch * BLOCK_SIZE + block.thread_rank()] = C[ch];
 				}
 				sampled_ard[(bbm * BLOCK_SIZE) + block.thread_rank()] = expected_invdepth;
+				for (int ch = 0; ch < OBJECTS; ++ch) {
+					sampled_ar_objs[(bbm * BLOCK_SIZE * OBJECTS) + ch * BLOCK_SIZE + block.thread_rank()] = O[ch];
+				}
 				++bbm;
 			}
 
@@ -404,6 +411,9 @@ renderCUDA(
 
 			expected_invdepth += (1.f / depths[collected_id[j]]) * alpha * T;
 
+			for (int ch = 0; ch < OBJECTS; ch++)
+				O[ch] += obj_features[collected_id[j] * OBJECTS + ch] * alpha * T;
+
 			T = test_T;
 
 			// Keep track of last range entry to update this
@@ -420,7 +430,9 @@ renderCUDA(
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
-		invdepth[pix_id] = expected_invdepth;
+		out_invdepth[pix_id] = expected_invdepth;
+		for (int ch = 0; ch < OBJECTS; ch++)
+			out_objects[ch * H * W + pix_id] = O[ch];
 	}
 
 	// max reduce the last contributor
@@ -438,10 +450,11 @@ void FORWARD::render(
 	const uint2* ranges,
 	const uint32_t* point_list,
 	const uint32_t* per_tile_bucket_offset, uint32_t* bucket_to_tile,
-	float* sampled_T, float* sampled_ar, float* sampled_ard,
+	float* sampled_T, float* sampled_ar, float* sampled_ard, float* sampled_ar_objs,
 	int W, int H,
 	const float2* means2D,
 	const float* colors,
+	const float* objects,
 	const float4* conic_opacity,
 	float* final_T,
 	uint32_t* n_contrib,
@@ -449,16 +462,18 @@ void FORWARD::render(
 	const float* bg_color,
 	float* out_color,
 	float* depths,
-	float* depth)
+	float* out_invdepth,
+	float* out_objects)
 {
-	renderCUDA<NUM_CHANNELS_3DGS> << <grid, block >> > (
+	renderCUDA<NUM_CHANNELS_3DGS, OBJECTS_SIZE> << <grid, block >> > (
 		ranges,
 		point_list,
 		per_tile_bucket_offset, bucket_to_tile,
-		sampled_T, sampled_ar, sampled_ard,
+		sampled_T, sampled_ar, sampled_ard, sampled_ar_objs,
 		W, H,
 		means2D,
 		colors,
+		objects,
 		conic_opacity,
 		final_T,
 		n_contrib,
@@ -466,7 +481,8 @@ void FORWARD::render(
 		bg_color,
 		out_color,
 		depths,
-		depth);
+		out_invdepth,
+		out_objects);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
@@ -477,6 +493,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	const float* opacities,
 	const float* dc,
 	const float* shs,
+	const float* dc_objs,
 	bool* clamped,
 	const float* cov3D_precomp,
 	const float* colors_precomp,
@@ -497,7 +514,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	bool prefiltered,
 	bool antialiasing)
 {
-	preprocessCUDA<NUM_CHANNELS_3DGS> << <(P + 255) / 256, 256 >> > (
+	preprocessCUDA<NUM_CHANNELS_3DGS, OBJECTS_SIZE> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
 		means3D,
 		scales,
@@ -506,6 +523,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		opacities,
 		dc,
 		shs,
+		dc_objs,
 		clamped,
 		cov3D_precomp,
 		colors_precomp,

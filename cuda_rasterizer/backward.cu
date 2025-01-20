@@ -393,7 +393,7 @@ __device__ void computeCov3D(int idx, const glm::vec3 scale, float mod, const gl
 // Backward pass of the preprocessing steps, except
 // for the covariance computation and inversion
 // (those are handled by a previous kernel call)
-template<int C>
+template<int C, int O>
 __global__ void preprocessCUDA(
 	int P, int D, int M,
 	const float3* means,
@@ -409,9 +409,11 @@ __global__ void preprocessCUDA(
 	const float3* dL_dmean2D,
 	glm::vec3* dL_dmeans,
 	float* dL_dcolor,
+	float* dL_dobjects,
 	float* dL_dcov3D,
 	float* dL_ddc,
 	float* dL_dsh,
+	// float* dL_ddc_objs,
 	glm::vec3* dL_dscale,
 	glm::vec4* dL_drot,
 	float* dL_dopacity)
@@ -443,12 +445,18 @@ __global__ void preprocessCUDA(
 	if (shs)
 		computeColorFromSH(idx, D, M, (glm::vec3*)means, *campos, dc, shs, clamped, (glm::vec3*)dL_dcolor, (glm::vec3*)dL_dmeans, (glm::vec3*)dL_ddc, (glm::vec3*)dL_dsh);
 
+	// // Compute gradient updates due to computing objects from dc_objs
+	// if (dL_dobjects)
+	// 	for (int ch = 0; ch < O; ch++) {
+	// 		dL_ddc_objs[idx * O + ch] = dL_dobjects[idx * O + ch]; // TODO: check this
+	// 	}
+
 	// Compute gradient updates due to computing covariance from scale/rotation
 	if (scales)
 		computeCov3D(idx, scales[idx], scale_modifier, rotations[idx], dL_dcov3D, dL_dscale, dL_drot);
 }
 
-template<uint32_t C>
+template<uint32_t C, uint32_t O>
 __global__ void
 PerGaussianRenderCUDA(
 	const uint2* __restrict__ ranges,
@@ -456,24 +464,28 @@ PerGaussianRenderCUDA(
 	int W, int H, int B,
 	const uint32_t* __restrict__ per_tile_bucket_offset,
 	const uint32_t* __restrict__ bucket_to_tile,
-	const float* __restrict__ sampled_T, const float* __restrict__ sampled_ar, const float* __restrict__ sampled_ard,
+	const float* __restrict__ sampled_T, const float* __restrict__ sampled_ar, const float* __restrict__ sampled_ard, const float* __restrict__ sampled_ar_objs,
 	const float* __restrict__ bg_color,
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
 	const float* __restrict__ colors,
 	const float* __restrict__ depths,
+	const float* __restrict__ objects,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const uint32_t* __restrict__ max_contrib,
 	const float* __restrict__ pixel_colors,
 	const float* __restrict__ pixel_invDepths,
+	const float* __restrict__ pixel_objects,
 	const float* __restrict__ dL_dpixels,
 	const float* __restrict__ dL_invdepths,
+	const float* __restrict__ dL_dpixels_objs,
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
-	float* __restrict__ dL_dinvdepths
+	float* __restrict__ dL_dinvdepths,
+	float* __restrict__ dL_dobjects
 ) {
 	// global_bucket_idx = warp_idx
 	auto block = cg::this_thread_block();
@@ -510,6 +522,7 @@ PerGaussianRenderCUDA(
 	float4 con_o = {0.0f, 0.0f, 0.0f, 0.0f};
 	float c[C] = {0.0f};
 	float invd = 0.f;
+	float o[O] = {0.0f};
 	if (valid_splat) {
 		gaussian_idx = point_list[splat_idx_global];
 		xy = points_xy_image[gaussian_idx];
@@ -517,6 +530,8 @@ PerGaussianRenderCUDA(
 		for (int ch = 0; ch < C; ++ch)
 			c[ch] = colors[gaussian_idx * C + ch];
 		invd = 1.f / depths[gaussian_idx];
+		for (int ch = 0; ch < O; ++ch)
+			o[ch] = objects[gaussian_idx * O + ch];
 	}
 
 	// Gradient accumulation variables
@@ -528,6 +543,7 @@ PerGaussianRenderCUDA(
 	float Register_dL_dopacity = 0.0f;
 	float Register_dL_dcolors[C] = {0.0f};
 	float Register_dL_dinvdepths = 0.0f;
+	float Register_dL_dobjects[O] = {0.0f};
 	
 	// tile metadata
 	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
@@ -540,8 +556,10 @@ PerGaussianRenderCUDA(
 	float last_contributor;
 	float ar[C];
 	float ard;
+	float ar_objs[O];
 	float dL_dpixel[C];
 	float dL_invdepth;
+	float dL_dpixel_objs[O];
 	const float ddelx_dx = 0.5 * W;
 	const float ddely_dy = 0.5 * H;
 
@@ -560,6 +578,10 @@ PerGaussianRenderCUDA(
 		}
 		ard = my_warp.shfl_up(ard, 1);
 		dL_invdepth = my_warp.shfl_up(dL_invdepth, 1);
+		for (int ch = 0; ch < O; ++ch) {
+			ar_objs[ch] = my_warp.shfl_up(ar_objs[ch], 1);
+			dL_dpixel_objs[ch] = my_warp.shfl_up(dL_dpixel_objs[ch], 1);
+		}
 
 		// which pixel index should this thread deal with?
 		int idx = i - my_warp.thread_rank();
@@ -575,12 +597,17 @@ PerGaussianRenderCUDA(
 			for (int ch = 0; ch < C; ++ch)
 				ar[ch] = -pixel_colors[ch * H * W + pix_id] + sampled_ar[global_bucket_idx * BLOCK_SIZE * C + ch * BLOCK_SIZE + idx];
 			ard = -pixel_invDepths[pix_id] + sampled_ard[global_bucket_idx * BLOCK_SIZE + idx];
+			for (int ch = 0; ch < O; ++ch)
+				ar_objs[ch] = -pixel_objects[ch * H * W + pix_id] + sampled_ar_objs[global_bucket_idx * BLOCK_SIZE * O + ch * BLOCK_SIZE + idx];
 			T_final = final_Ts[pix_id];
 			last_contributor = n_contrib[pix_id];
 			for (int ch = 0; ch < C; ++ch) {
 				dL_dpixel[ch] = dL_dpixels[ch * H * W + pix_id];
 			}
 			dL_invdepth = dL_invdepths[pix_id];
+			for (int ch = 0; ch < O; ++ch) {
+				dL_dpixel_objs[ch] = dL_dpixels_objs[ch * H * W + pix_id];
+			}
 		}
 
 		// do work
@@ -614,6 +641,15 @@ PerGaussianRenderCUDA(
 			ard += weight * invd;
 			Register_dL_dinvdepths += weight * dL_invdepth;
 			dL_dalpha += ((invd * T) - (1.0f / (1.0f - alpha)) * (-ard)) * dL_invdepth;
+
+			// add the gradient contribution of this pixel's objects to the gaussian
+			for (int ch = 0; ch < O; ++ch) {
+				ar_objs[ch] += weight * o[ch]; // TODO: check
+				const float &dL_dchannel_objs = dL_dpixel_objs[ch];
+				Register_dL_dobjects[ch] += weight * dL_dchannel_objs;
+				dL_dalpha += ((o[ch] * T) - (1.0f / (1.0f - alpha)) * (-ar_objs[ch])) * dL_dchannel_objs;
+
+			}
 
 			// Account for last sample for colour
 			dL_dalpha += (-T_final / (1.0f - alpha)) * bg_dot_dpixel;
@@ -652,6 +688,9 @@ PerGaussianRenderCUDA(
 			atomicAdd(&dL_dcolors[gaussian_idx * C + ch], Register_dL_dcolors[ch]);
 		}
 		atomicAdd(&dL_dinvdepths[gaussian_idx], Register_dL_dinvdepths);
+		for (int ch = 0; ch < O; ++ch) {
+			atomicAdd(&dL_dobjects[gaussian_idx * O + ch], Register_dL_dobjects[ch]);
+		}
 	}
 }
 
@@ -678,9 +717,11 @@ void BACKWARD::preprocess(
 	float* dL_dopacity,
 	glm::vec3* dL_dmean3D,
 	float* dL_dcolor,
+	float* dL_dobjects,
 	float* dL_dcov3D,
 	float* dL_ddc,
 	float* dL_dsh,
+	// float* dL_ddc_objs,
 	glm::vec3* dL_dscale,
 	glm::vec4* dL_drot,
 	bool antialiasing)
@@ -710,7 +751,7 @@ void BACKWARD::preprocess(
 	// Propagate gradients for remaining steps: finish 3D mean gradients,
 	// propagate color gradients to SH (if desireD), propagate 3D covariance
 	// matrix gradients to scale and rotation.
-	preprocessCUDA<NUM_CHANNELS_3DGS> << < (P + 255) / 256, 256 >> > (
+	preprocessCUDA<NUM_CHANNELS_3DGS, OBJECTS_SIZE> << < (P + 255) / 256, 256 >> > (
 		P, D, M,
 		(float3*)means3D,
 		radii,
@@ -725,9 +766,11 @@ void BACKWARD::preprocess(
 		(float3*)dL_dmean2D,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,
+		dL_dobjects,
 		dL_dcov3D,
 		dL_ddc,
 		dL_dsh,
+		// dL_ddc_objs,
 		dL_dscale,
 		dL_drot,
 		dL_dopacity);
@@ -740,49 +783,57 @@ void BACKWARD::render(
 	int W, int H, int R, int B,
 	const uint32_t* per_bucket_tile_offset,
 	const uint32_t* bucket_to_tile,
-	const float* sampled_T, const float* sampled_ar, const float* sampled_ard,
+	const float* sampled_T, const float* sampled_ar, const float* sampled_ard, const float* sampled_ar_objs,
 	const float* bg_color,
 	const float2* means2D,
 	const float4* conic_opacity,
 	const float* colors,
 	const float* depths,
+	const float* objects,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
 	const uint32_t* max_contrib,
 	const float* pixel_colors,
 	const float* pixel_invDepths,
+	const float* pixel_objects,
 	const float* dL_dpixels,
 	const float* dL_invdepths,
+	const float* dL_dpixels_objs,
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
 	float* dL_dcolors,
-	float* dL_dinvdepths)
+	float* dL_dinvdepths,
+	float* dL_dobjects)
 {
 	const int THREADS = 32;
-	PerGaussianRenderCUDA<NUM_CHANNELS_3DGS> <<<((B*32) + THREADS - 1) / THREADS,THREADS>>>(
+	PerGaussianRenderCUDA<NUM_CHANNELS_3DGS, OBJECTS_SIZE> <<<((B*32) + THREADS - 1) / THREADS,THREADS>>>(
 		ranges,
 		point_list,
 		W, H, B,
 		per_bucket_tile_offset,
 		bucket_to_tile,
-		sampled_T, sampled_ar, sampled_ard,
+		sampled_T, sampled_ar, sampled_ard, sampled_ar_objs,
 		bg_color,
 		means2D,
 		conic_opacity,
 		colors,
 		depths,
+		objects,
 		final_Ts,
 		n_contrib,
 		max_contrib,
 		pixel_colors,
 		pixel_invDepths,
+		pixel_objects,
 		dL_dpixels,
 		dL_invdepths,
+		dL_dpixels_objs,
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,
 		dL_dcolors, 
-		dL_dinvdepths
+		dL_dinvdepths,
+		dL_dobjects
 		);
 }
